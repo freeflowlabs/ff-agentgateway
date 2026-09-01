@@ -85,6 +85,8 @@ EOF
 # The runner stage copies a marker from here, which forces buildx to run this stage;
 # a failing test fails the build before anything is pushed or rolled out.
 FROM builder AS tester
+# test_helpers embeds examples/tls/certs/ca-cert.pem; the release build does not need it.
+COPY examples ./examples
 RUN --mount=type=cache,target=/app/target \
     --mount=type=cache,id=cargo,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
