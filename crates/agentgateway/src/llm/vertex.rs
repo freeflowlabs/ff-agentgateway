@@ -176,9 +176,18 @@ impl Provider {
 	/// There is no longer a bare `aiplatform.googleapis.com` arm: that host is the global
 	/// endpoint, and a `global` region cannot be configured (de_us_region rejects it) nor
 	/// defaulted to (unset resolves to the US multi-region).
+	///
+	/// The `us` multi-region has no `us-aiplatform.googleapis.com` host — Vertex rejects
+	/// that hostname with 400 INVALID_ARGUMENT (verified live 2026-09-01). Multi-regions
+	/// are served on the regional-endpoint form `aiplatform.us.rep.googleapis.com`, which
+	/// is also the host the google-genai SDK (>= 2.x) dials for `us`, and which carries
+	/// the in-region processing guarantee at the host level. Single regions keep the
+	/// `{region}-aiplatform.googleapis.com` form.
 	pub fn get_host(&self, _request_model: Option<&str>) -> Strng {
-		match &self.region {
-			None => strng::literal!("us-aiplatform.googleapis.com"),
+		match self.region.as_deref() {
+			None | Some(US_MULTI_REGION) => {
+				strng::format!("aiplatform.{US_MULTI_REGION}.rep.googleapis.com")
+			},
 			Some(region) => strng::format!("{region}-aiplatform.googleapis.com"),
 		}
 	}
@@ -289,9 +298,11 @@ mod tests {
 	}
 
 	#[rstest::rstest]
-	// Unset resolves to the US multi-region, not the global endpoint.
-	#[case::no_region(None, "us-aiplatform.googleapis.com")]
-	#[case::us_multi_region(Some("us"), "us-aiplatform.googleapis.com")]
+	// Unset resolves to the US multi-region, not the global endpoint. The multi-region is
+	// served on the .rep. regional-endpoint host — `us-aiplatform.googleapis.com` does not
+	// exist (Vertex rejects it with 400 INVALID_ARGUMENT).
+	#[case::no_region(None, "aiplatform.us.rep.googleapis.com")]
+	#[case::us_multi_region(Some("us"), "aiplatform.us.rep.googleapis.com")]
 	#[case::regional(Some("us-central1"), "us-central1-aiplatform.googleapis.com")]
 	fn test_get_host(#[case] region: Option<&str>, #[case] expected: &str) {
 		let p = Provider {
@@ -344,7 +355,7 @@ mod tests {
 		let json = serde_json::json!({"projectId": "test-project"});
 		let p: Provider = serde_json::from_value(json).expect("absent region is allowed");
 		assert_eq!(p.region, None);
-		assert_eq!(p.get_host(None).as_str(), "us-aiplatform.googleapis.com");
+		assert_eq!(p.get_host(None).as_str(), "aiplatform.us.rep.googleapis.com");
 	}
 
 	#[test]
