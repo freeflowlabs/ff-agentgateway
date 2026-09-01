@@ -81,6 +81,18 @@ if /out/agentgateway --version | grep -q '"unknown"'; then
 fi
 EOF
 
+# Test gate: the image cannot be produced unless the Vertex provider tests pass.
+# The runner stage copies a marker from here, which forces buildx to run this stage;
+# a failing test fails the build before anything is pushed or rolled out.
+FROM builder AS tester
+RUN --mount=type=cache,target=/app/target \
+    --mount=type=cache,id=cargo,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
+    <<EOF
+cargo test -p agentgateway llm::vertex -- --nocapture || exit 1
+mkdir -p /out && touch /out/tests-passed
+EOF
+
 FROM cgr.dev/chainguard/glibc-dynamic AS runner
 
 ARG TARGETARCH
@@ -88,6 +100,7 @@ ARG TARGETARCH
 WORKDIR /
 
 COPY --from=builder /out/agentgateway /app/agentgateway
+COPY --from=tester /out/tests-passed /app/tests-passed
 
 LABEL org.opencontainers.image.source=https://github.com/agentgateway/agentgateway
 LABEL org.opencontainers.image.description="Agentgateway is an open source project that is built on AI-native protocols to connect, secure, and observe agent-to-agent and agent-to-tool communication across any agent framework and environment."
