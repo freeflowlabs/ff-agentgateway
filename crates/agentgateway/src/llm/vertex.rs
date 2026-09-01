@@ -7,11 +7,63 @@ use crate::*;
 
 const ANTHROPIC_VERSION: &str = "vertex-2023-10-16";
 
+/// The Vertex `us` multi-region, used as the default when no region is configured.
+///
+/// Upstream defaults an unset region to `global`. We do not: model inference runs on
+/// customer content and must be served from the United States, and `global` is not a
+/// region — Vertex may serve a global-endpoint request from wherever the model is
+/// available, so it carries no US-processing commitment.
+const US_MULTI_REGION: &str = "us";
+
+/// True when `region` names the US multi-region or a US region.
+///
+/// Any `us-<region>` (us-central1, us-east4, us-west1, ...) is United States; matching the
+/// prefix rather than enumerating regions means a newly opened US region needs no code
+/// change. Other locales do not use this prefix — Canada is `northamerica-*` — so they are
+/// correctly excluded.
+fn is_us_region(region: &str) -> bool {
+	let region = region.trim().to_ascii_lowercase();
+	region == US_MULTI_REGION || region.starts_with("us-")
+}
+
+/// Reject a non-US Vertex region at config-parse time, so the gateway refuses to start
+/// rather than proxying customer content out of the United States.
+///
+/// This is deliberately fatal instead of a warning-and-override: a silently corrected
+/// value hides the misconfiguration, and there is no case where serving elsewhere is the
+/// desired outcome. There is no override flag.
+fn de_us_region<'de, D>(deserializer: D) -> Result<Option<Strng>, D::Error>
+where
+	D: serde::Deserializer<'de>,
+{
+	use serde::Deserialize;
+	let region = Option::<Strng>::deserialize(deserializer)?;
+	match &region {
+		// Absent is allowed and resolves to the US multi-region (see get_host).
+		None => Ok(region),
+		// Normalised on the way in: the value is interpolated into the upstream host and
+		// into the locations/<region> path, and Vertex expects it lower-case.
+		Some(r) if is_us_region(r) => Ok(Some(strng::new(r.trim().to_ascii_lowercase()))),
+		Some(r) => Err(serde::de::Error::custom(format!(
+			"vertex region {r:?} is not a US location; refusing to start. Model inference \
+			 must be served from the US: set the region to {US_MULTI_REGION:?} or a 'us-' \
+			 region. Note that 'global' is not a region — Vertex may serve it from any \
+			 region where the model is available, so it carries no US-processing commitment."
+		))),
+	}
+}
+
 #[apply(schema!)]
 pub struct Provider {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub model: Option<Strng>,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
+	/// Vertex serving location. Validated on parse: a non-US value fails config load and
+	/// the gateway does not start. Unset resolves to the US multi-region, never `global`.
+	#[serde(
+		default,
+		skip_serializing_if = "Option::is_none",
+		deserialize_with = "de_us_region"
+	)]
 	pub region: Option<Strng>,
 	pub project_id: Strng,
 }
@@ -71,10 +123,13 @@ impl Provider {
 		request_model: Option<&str>,
 		streaming: bool,
 	) -> Strng {
+		// Unset resolves to the US multi-region, not `global`: an omitted region must not
+		// silently opt the deployment out of US serving. A configured region is already
+		// known to be a US one — de_us_region rejects anything else at parse time.
 		let location = self
 			.region
 			.clone()
-			.unwrap_or_else(|| strng::literal!("global"));
+			.unwrap_or_else(|| strng::literal!("us"));
 
 		match (route, self.anthropic_model(request_model)) {
 			(RouteType::AnthropicTokenCount, _) => {
@@ -116,10 +171,14 @@ impl Provider {
 		}
 	}
 
+	/// Upstream host for the configured region.
+	///
+	/// There is no longer a bare `aiplatform.googleapis.com` arm: that host is the global
+	/// endpoint, and a `global` region cannot be configured (de_us_region rejects it) nor
+	/// defaulted to (unset resolves to the US multi-region).
 	pub fn get_host(&self, _request_model: Option<&str>) -> Strng {
 		match &self.region {
-			None => strng::literal!("aiplatform.googleapis.com"),
-			Some(region) if region == "global" => strng::literal!("aiplatform.googleapis.com"),
+			None => strng::literal!("us-aiplatform.googleapis.com"),
 			Some(region) => strng::format!("{region}-aiplatform.googleapis.com"),
 		}
 	}
@@ -230,8 +289,9 @@ mod tests {
 	}
 
 	#[rstest::rstest]
-	#[case::no_region(None, "aiplatform.googleapis.com")]
-	#[case::global_region(Some("global"), "aiplatform.googleapis.com")]
+	// Unset resolves to the US multi-region, not the global endpoint.
+	#[case::no_region(None, "us-aiplatform.googleapis.com")]
+	#[case::us_multi_region(Some("us"), "us-aiplatform.googleapis.com")]
 	#[case::regional(Some("us-central1"), "us-central1-aiplatform.googleapis.com")]
 	fn test_get_host(#[case] region: Option<&str>, #[case] expected: &str) {
 		let p = Provider {
@@ -240,6 +300,51 @@ mod tests {
 			region: region.map(strng::new),
 		};
 		assert_eq!(p.get_host(None).as_str(), expected);
+	}
+
+	#[rstest::rstest]
+	#[case::us_multi_region("us")]
+	#[case::us_central("us-central1")]
+	#[case::us_east("us-east4")]
+	fn test_us_region_accepted(#[case] region: &str) {
+		let json = serde_json::json!({"projectId": "test-project", "region": region});
+		let p: Provider = serde_json::from_value(json).expect("US region must parse");
+		assert_eq!(p.region.as_deref(), Some(region));
+	}
+
+	#[test]
+	fn test_region_is_normalised_to_lower_case() {
+		// The value is interpolated into the host and the locations/<region> path, so an
+		// upper-case config value must not produce locations/US.
+		let json = serde_json::json!({"projectId": "test-project", "region": "US-Central1"});
+		let p: Provider = serde_json::from_value(json).expect("US region must parse");
+		assert_eq!(p.region.as_deref(), Some("us-central1"));
+		assert_eq!(p.get_host(None).as_str(), "us-central1-aiplatform.googleapis.com");
+	}
+
+	#[rstest::rstest]
+	// `global` is refused by name: it is not a region and carries no US-processing
+	// commitment, so it must not be configurable.
+	#[case::global("global")]
+	#[case::europe("europe-west1")]
+	#[case::canada("northamerica-northeast1")]
+	#[case::asia("asia-east1")]
+	fn test_non_us_region_refused(#[case] region: &str) {
+		let json = serde_json::json!({"projectId": "test-project", "region": region});
+		let err = serde_json::from_value::<Provider>(json)
+			.expect_err("a non-US region must fail config parse so the gateway does not start");
+		assert!(
+			err.to_string().contains("not a US location"),
+			"unexpected error: {err}"
+		);
+	}
+
+	#[test]
+	fn test_absent_region_parses_and_defaults_to_us() {
+		let json = serde_json::json!({"projectId": "test-project"});
+		let p: Provider = serde_json::from_value(json).expect("absent region is allowed");
+		assert_eq!(p.region, None);
+		assert_eq!(p.get_host(None).as_str(), "us-aiplatform.googleapis.com");
 	}
 
 	#[test]
